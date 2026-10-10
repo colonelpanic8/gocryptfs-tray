@@ -1,0 +1,23 @@
+[package]
+name = "gocryptfs-tray"
+version = "0.1.0"
+edition = "2024"
+description = "System tray and CLI for gocryptfs vaults, with PIN-gated unlocking"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/colonelpanic8/gocryptfs-tray"
+readme = "README.md"
+authors = ["Ivan Malison <IvanMalison@gmail.com>"]
+
+[dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+ksni = { version = "0.3.6", features = ["blocking"] }
+libc = "0.2.190"
+pinentry = "0.8.0"
+rpassword = "7.5.4"
+secrecy = "0.10.3"
+serde = { version = "1.0.229", features = ["derive"] }
+toml = "1.1.8"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
