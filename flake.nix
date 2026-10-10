@@ -41,7 +41,7 @@
           nativeBuildInputs = [pkgs.makeWrapper];
           postInstall = ''
             wrapProgram $out/bin/gocryptfs-tray \
-              --suffix PATH : ${pkgs.lib.makeBinPath [pkgs.gocryptfs pkgs.xdg-utils]}
+              --suffix PATH : ${pkgs.lib.makeBinPath [pkgs.gocryptfs pkgs.libnotify pkgs.xdg-utils]}
           '';
           meta = {
             inherit (cargoToml.package) description;
@@ -58,7 +58,7 @@
           {
             inherit package;
           }
-          // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             vm = import ./nix/vm-test.nix {
               inherit pkgs;
               module = self.nixosModules.default;
@@ -91,6 +91,7 @@
                       link = "/home/alice/Private";
                       secretCommand = ["pass" "show" "vault"];
                       syncthingIgnore.folder = "/var/lib/syncthing/sync";
+                      autoLockMinutes = 30;
                     };
                   }
                 ];

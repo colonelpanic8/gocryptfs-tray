@@ -68,6 +68,15 @@
         default = 4;
         description = "Minimum length enforced when setting a PIN.";
       };
+      autoLockMinutes = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 30;
+        description = ''
+          Default auto-lock timeout in idle minutes, enforced while the tray
+          runs. The tray menu can override it per user.
+        '';
+      };
       gocryptfsArgs = mkOption {
         type = types.listOf types.str;
         default = [];
@@ -121,6 +130,7 @@
       };
     }
     // lib.optionalAttrs (vault.link != null) {inherit (vault) link;}
+    // lib.optionalAttrs (vault.autoLockMinutes != null) {auto_lock_minutes = vault.autoLockMinutes;}
     // lib.optionalAttrs (vault.secretCommand != null) {secret_command = vault.secretCommand;};
 
   configFile = (pkgs.formats.toml {}).generate "gocryptfs-tray.toml" (

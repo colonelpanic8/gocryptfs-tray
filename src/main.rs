@@ -30,7 +30,12 @@ enum Command {
     Unlock { vault: Option<String> },
     /// Lock a vault
     #[command(alias = "unmount")]
-    Lock { vault: Option<String> },
+    Lock {
+        vault: Option<String>,
+        /// Lock even while programs are using the vault (they may lose access to open files)
+        #[arg(long)]
+        force: bool,
+    },
     /// Change a vault's PIN (an empty current PIN means none is set yet)
     ChangePin { vault: Option<String> },
     /// Create a new, empty vault
@@ -81,9 +86,17 @@ fn main() -> Result<()> {
             println!("{name} unlocked at {}", vault.open_path().display());
             Ok(())
         }
-        Command::Lock { vault } => {
+        Command::Lock { vault, force } => {
             let (name, vault_config) = config.select(vault.as_deref())?;
-            Vault::new(name, vault_config).lock()?;
+            Vault::new(name, vault_config)
+                .lock(force)
+                .map_err(|error| {
+                    if error.downcast_ref::<vault::InUse>().is_some() {
+                        error.context("close those programs or pass --force")
+                    } else {
+                        error
+                    }
+                })?;
             println!("{name} locked");
             Ok(())
         }

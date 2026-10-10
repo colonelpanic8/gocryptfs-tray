@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 use anyhow::{Context, Result, bail};
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::activity;
 use crate::config::{Backend, VaultConfig};
 use crate::mounts;
 
@@ -27,6 +28,18 @@ impl std::error::Error for WrongPassword {}
 pub fn is_wrong_password(error: &anyhow::Error) -> bool {
     error.downcast_ref::<WrongPassword>().is_some()
 }
+
+/// Locking was refused because these programs are using the vault.
+#[derive(Debug)]
+pub struct InUse(pub Vec<String>);
+
+impl std::fmt::Display for InUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the vault is in use by: {}", self.0.join(", "))
+    }
+}
+
+impl std::error::Error for InUse {}
 
 pub struct Vault<'a> {
     pub name: &'a str,
@@ -93,19 +106,29 @@ impl<'a> Vault<'a> {
         Ok(())
     }
 
-    pub fn lock(&self) -> Result<()> {
+    /// Unless `force`, refuses while programs are using the vault. With
+    /// `force`, unmounts lazily: the vault disappears at once, and programs
+    /// still using it may lose access to their open files.
+    pub fn lock(&self, force: bool) -> Result<()> {
+        if !self.is_mounted() {
+            return Ok(());
+        }
+        if !force {
+            let users = activity::users(&self.config.mount_dir);
+            if !users.is_empty() {
+                return Err(InUse(users).into());
+            }
+        }
         match &self.config.backend {
             Backend::Direct { .. } => {
-                if !self.is_mounted() {
-                    return Ok(());
-                }
+                let flags: &[&str] = if force { &["-u", "-z"] } else { &["-u"] };
                 let status = Command::new("fusermount3")
-                    .arg("-u")
+                    .args(flags)
                     .arg(&self.config.mount_dir)
                     .status()
                     .or_else(|_| {
                         Command::new("fusermount")
-                            .arg("-u")
+                            .args(flags)
                             .arg(&self.config.mount_dir)
                             .status()
                     })
@@ -114,6 +137,7 @@ impl<'a> Vault<'a> {
                     bail!("fusermount failed; is something still using the vault?");
                 }
             }
+            // gocryptfs falls back to a lazy unmount itself when it is stopped while busy.
             Backend::Systemd { mount_unit, .. } => systemctl(&["stop", mount_unit])?,
         }
         Ok(())
@@ -339,6 +363,7 @@ mod tests {
             secret_command,
             pin,
             min_pin_length: 4,
+            auto_lock_minutes: None,
             backend: Backend::Direct {
                 gocryptfs_args: vec![],
             },

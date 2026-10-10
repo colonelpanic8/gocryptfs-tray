@@ -10,9 +10,15 @@ Syncthing.
 - **A loud reminder.** While any vault is unlocked, the tray icon is a red
   badge with an open padlock and the item reports `NeedsAttention`. The icon is
   rendered in code, so it is red in every icon theme.
+- **Auto-lock when idle.** While the tray runs, a vault locks after a chosen
+  number of idle minutes; pick the timeout from the tray menu. File opens,
+  reads and writes count as activity, and the vault never auto-locks while one
+  of your processes has a file open or its working directory inside it.
 - **Lock from the menu only.** Left click unlocks, or opens the folder if the
   vault is already unlocked. Locking needs a deliberate menu click, so a stray
-  click cannot yank the vault away from open files.
+  click cannot yank the vault away from open files. If programs are using the
+  vault, the tray names them and asks before locking anyway (`lock --force` on
+  the CLI).
 - **Ciphertext owned by another user.** With the systemd backend, gocryptfs runs
   as e.g. `syncthing`, so every encrypted file stays writable by the sync
   daemon, while the decrypted view belongs to you alone.
@@ -26,7 +32,7 @@ Syncthing.
 gocryptfs-tray tray                # run the tray icon
 gocryptfs-tray status
 gocryptfs-tray unlock [VAULT]      # alias: mount
-gocryptfs-tray lock [VAULT]        # alias: unmount
+gocryptfs-tray lock [--force] [VAULT]  # alias: unmount
 gocryptfs-tray change-pin [VAULT]  # an empty current PIN means none is set yet
 gocryptfs-tray init [VAULT]        # create a new vault
 ```
@@ -53,7 +59,10 @@ backend = { type = "direct", gocryptfs_args = ["-sharedstorage"] }
 ```
 
 Optional per-vault keys: `link` (the path to open, if different from
-`mount_dir`) and `owner` (only show the vault to that user).
+`mount_dir`), `owner` (only show the vault to that user) and
+`auto_lock_minutes` (the default idle timeout). Timeouts chosen in the tray
+menu are saved in `~/.local/state/gocryptfs-tray/state.toml` and take
+precedence.
 
 The `direct` backend runs gocryptfs as you. The `systemd` backend hands the
 password to system units through a group-readable file in `handoff_dir`. The

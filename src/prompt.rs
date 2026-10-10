@@ -35,6 +35,7 @@ pub fn check_length(pin: &SecretString, min_length: usize) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct Pinentry {
     program: Option<String>,
 }
@@ -73,6 +74,22 @@ impl Pinentry {
             Err(pinentry::Error::Cancelled) => Ok(None),
             Err(error) => Err(anyhow::anyhow!("pinentry failed: {error}")),
         }
+    }
+
+    /// Asks a yes/no question; anything but an explicit yes is a no.
+    pub fn confirm(&self, question: &str, yes: &str) -> bool {
+        let dialog = match &self.program {
+            Some(program) => pinentry::ConfirmationDialog::with_binary(program),
+            None => pinentry::ConfirmationDialog::with_default_binary(),
+        };
+        dialog.is_some_and(|mut dialog| {
+            dialog
+                .with_title("gocryptfs-tray")
+                .with_ok(yes)
+                .with_cancel("Cancel")
+                .confirm(question)
+                .unwrap_or(false)
+        })
     }
 
     pub fn show_error(&self, message: &str) {

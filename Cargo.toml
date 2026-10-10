@@ -12,6 +12,7 @@ authors = ["Ivan Malison <IvanMalison@gmail.com>"]
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
+inotify = "0.11.5"
 ksni = { version = "0.3.6", features = ["blocking"] }
 libc = "0.2.190"
 pinentry = "0.8.0"

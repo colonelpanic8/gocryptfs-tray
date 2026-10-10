@@ -77,5 +77,16 @@ pkgs.testers.runNixOSTest {
         machine.succeed(as_alice("grep -q hello ~/Private/note.txt"))
         machine.succeed(as_alice("gocryptfs-tray lock"))
         machine.fail("mountpoint -q /run/gocryptfs-tray/private/mnt")
+
+    with subtest("locking refuses while in use unless forced"):
+        machine.succeed(as_alice("echo 5678 | gocryptfs-tray unlock"))
+        machine.succeed("su - alice -c 'cd ~/Private && exec sleep 300' >/dev/null 2>&1 &")
+        machine.wait_until_succeeds("pgrep -u alice -x sleep")
+        output = machine.fail(as_alice("gocryptfs-tray lock 2>&1"))
+        assert "sleep" in output and "--force" in output, output
+        machine.succeed("mountpoint -q /run/gocryptfs-tray/private/mnt")
+        machine.succeed(as_alice("gocryptfs-tray lock --force"))
+        machine.fail("mountpoint -q /run/gocryptfs-tray/private/mnt")
+        machine.succeed("pkill -u alice -x sleep")
   '';
 }

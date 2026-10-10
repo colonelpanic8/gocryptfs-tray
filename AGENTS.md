@@ -14,6 +14,10 @@ password is a secret command's output plus a PIN.
 - `src/tray.rs`: the tray. Menu callbacks only enqueue actions; a worker thread
   runs pinentry and the vault operations so the tray never blocks.
 - `src/prompt.rs`: terminal and pinentry PIN prompts.
+- `src/activity.rs`: auto-lock activity: a recursive inotify watcher over the
+  decrypted tree (directory listings deliberately ignored, so the watcher's own
+  scan does not count) and a `/proc` scan for open files or cwds inside it.
+- `src/state.rs`: settings chosen in the tray menu (auto-lock timeouts).
 - `nix/module.nix`: NixOS module (units, group, polkit rule, tmpfiles, ciphertext
   lockdown, Syncthing `.stignore` block, link, tray user service).
 - `nix/vm-test.nix`: NixOS VM test of the module and CLI end to end.
@@ -31,6 +35,8 @@ password is a secret command's output plus a PIN.
 - Syncthing globs allow one range or one plain list per character class; the
   `.stignore` patterns spell the base64url alphabet out as a list.
 - Locking stays menu-only; left click must never lock.
+- Auto-lock must never lock while one of the user's processes has a file open
+  or its cwd inside the vault.
 
 ## Checks
 

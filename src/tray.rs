@@ -1,30 +1,43 @@
+use std::collections::HashMap;
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use ksni::blocking::TrayMethods;
-use ksni::menu::{MenuItem, StandardItem};
+use ksni::menu::{MenuItem, RadioGroup, RadioItem, StandardItem, SubMenu};
 use secrecy::SecretString;
 
+use crate::activity::{self, LastActivity};
 use crate::config::Config;
 use crate::icons::{self, LockState};
 use crate::mounts;
 use crate::prompt::Pinentry;
+use crate::state::State;
 use crate::vault::{self, Vault};
 
 pub const TRAY_ID: &str = "gocryptfs-tray";
 
+const TICK: Duration = Duration::from_secs(30);
+const AUTO_LOCK_CHOICES: [u64; 6] = [5, 15, 30, 60, 120, 240];
+
 enum Action {
     Refresh,
+    Tick,
     Unlock(String),
     Lock(String),
     Open(String),
     ChangePin(String),
+    SetAutoLock(String, Option<u64>),
 }
 
 struct VaultStatus {
     name: String,
     mounted: bool,
     busy: bool,
+    auto_lock_minutes: Option<u64>,
+    /// Minutes left before auto-lock, while unlocked.
+    locks_in: Option<u64>,
 }
 
 struct Tray {
@@ -43,10 +56,11 @@ impl Tray {
 
     fn vault_items(&self, vault: &VaultStatus, prefix: &str) -> Vec<MenuItem<Self>> {
         let name = vault.name.clone();
-        let state = match (vault.busy, vault.mounted) {
-            (true, _) => "working…",
-            (false, true) => "UNLOCKED",
-            (false, false) => "locked",
+        let state = match (vault.busy, vault.mounted, vault.locks_in) {
+            (true, _, _) => "working…".to_owned(),
+            (false, true, Some(minutes)) => format!("UNLOCKED, locks in {minutes} min"),
+            (false, true, None) => "UNLOCKED".to_owned(),
+            (false, false, _) => "locked".to_owned(),
         };
         let mut items: Vec<MenuItem<Self>> = vec![
             StandardItem {
@@ -91,6 +105,7 @@ impl Tray {
             }
             .into(),
         );
+        items.push(auto_lock_menu(vault, prefix));
         items.push(
             StandardItem {
                 label: format!("{prefix}Change PIN…"),
@@ -103,6 +118,54 @@ impl Tray {
             .into(),
         );
         items
+    }
+}
+
+fn auto_lock_menu(vault: &VaultStatus, prefix: &str) -> MenuItem<Tray> {
+    // Off, the standard choices, and a configured value that is not among them.
+    let mut choices: Vec<Option<u64>> = vec![None];
+    choices.extend(AUTO_LOCK_CHOICES.iter().map(|minutes| Some(*minutes)));
+    if !choices.contains(&vault.auto_lock_minutes) {
+        choices.push(vault.auto_lock_minutes);
+        choices[1..].sort();
+    }
+    let selected = choices
+        .iter()
+        .position(|choice| *choice == vault.auto_lock_minutes)
+        .unwrap_or(0);
+    let options = choices
+        .iter()
+        .map(|choice| RadioItem {
+            label: match choice {
+                None => "Off".into(),
+                Some(minutes) => describe_minutes(*minutes),
+            },
+            ..Default::default()
+        })
+        .collect();
+    let name = vault.name.clone();
+    SubMenu {
+        label: format!("{prefix}Auto-lock when idle"),
+        submenu: vec![
+            RadioGroup {
+                selected,
+                select: Box::new(move |tray: &mut Tray, index| {
+                    tray.send(Action::SetAutoLock(name.clone(), choices[index]));
+                }),
+                options,
+            }
+            .into(),
+        ],
+        ..Default::default()
+    }
+    .into()
+}
+
+fn describe_minutes(minutes: u64) -> String {
+    match minutes {
+        60 => "1 hour".into(),
+        minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
+        minutes => format!("{minutes} minutes"),
     }
 }
 
@@ -140,11 +203,14 @@ impl ksni::Tray for Tray {
     }
 
     fn tool_tip(&self) -> ksni::ToolTip {
-        let unlocked: Vec<&str> = self
+        let unlocked: Vec<String> = self
             .vaults
             .iter()
             .filter(|vault| vault.mounted)
-            .map(|vault| vault.name.as_str())
+            .map(|vault| match vault.locks_in {
+                Some(minutes) => format!("{} (locks in {minutes} min)", vault.name),
+                None => vault.name.clone(),
+            })
             .collect();
         ksni::ToolTip {
             title: if unlocked.is_empty() {
@@ -189,6 +255,15 @@ impl ksni::Tray for Tray {
     }
 }
 
+/// The worker's view of each vault: config, auto-lock setting and activity.
+struct Worker {
+    config: Config,
+    state: State,
+    pinentry: Pinentry,
+    activity: HashMap<String, LastActivity>,
+    handle: ksni::blocking::Handle<Tray>,
+}
+
 pub fn run(config: Config) -> Result<()> {
     let names: Vec<String> = config
         .visible_vaults()
@@ -197,6 +272,7 @@ pub fn run(config: Config) -> Result<()> {
         .collect();
     anyhow::ensure!(!names.is_empty(), "no vaults configured for this user");
 
+    let state = State::load();
     let (actions, queue) = mpsc::channel();
     let tray = Tray {
         vaults: names
@@ -205,6 +281,9 @@ pub fn run(config: Config) -> Result<()> {
                 name: name.clone(),
                 mounted: false,
                 busy: false,
+                auto_lock_minutes: state
+                    .auto_lock_minutes(name, config.vaults[name].auto_lock_minutes),
+                locks_in: None,
             })
             .collect(),
         actions: actions.clone(),
@@ -219,66 +298,226 @@ pub fn run(config: Config) -> Result<()> {
             tracing::error!("watching mounts failed: {error:#}");
         }
     });
-    actions.send(Action::Refresh)?;
+    let ticker = actions.clone();
+    std::thread::spawn(move || {
+        while ticker.send(Action::Tick).is_ok() {
+            std::thread::sleep(TICK);
+        }
+    });
 
-    let pinentry = Pinentry::new(config.pinentry.clone());
-    let set_busy = |name: &str, busy: bool| {
-        handle.update(|tray: &mut Tray| {
+    let mut worker = Worker {
+        pinentry: Pinentry::new(config.pinentry.clone()),
+        config,
+        state,
+        activity: HashMap::new(),
+        handle,
+    };
+    for action in queue {
+        worker.handle_action(action);
+        worker.refresh();
+    }
+    Ok(())
+}
+
+impl Worker {
+    fn vault(&self, name: &str) -> Option<Vault<'_>> {
+        self.config
+            .select(Some(name))
+            .ok()
+            .map(|(name, config)| Vault::new(name, config))
+    }
+
+    fn auto_lock_minutes(&self, name: &str) -> Option<u64> {
+        let configured = self.config.vaults.get(name)?.auto_lock_minutes;
+        self.state.auto_lock_minutes(name, configured)
+    }
+
+    fn set_busy(&self, name: &str, busy: bool) {
+        self.handle.update(|tray: &mut Tray| {
             for vault in &mut tray.vaults {
                 if vault.name == name {
                     vault.busy = busy;
                 }
             }
         });
-    };
+    }
 
-    for action in queue {
+    fn handle_action(&mut self, action: Action) {
         match action {
             Action::Refresh => {}
+            Action::Tick => self.auto_lock(),
             Action::Open(name) => {
-                let (name, vault_config) = config.select(Some(&name))?;
-                let vault = Vault::new(name, vault_config);
-                if let Err(error) = std::process::Command::new("xdg-open")
-                    .arg(vault.open_path())
-                    .spawn()
-                {
-                    pinentry.show_error(&format!("Could not open the folder: {error}"));
-                }
+                let Some(vault) = self.vault(&name) else {
+                    return;
+                };
+                open_folder(self.pinentry.clone(), vault.open_path().to_path_buf());
             }
             Action::Unlock(name) => {
-                let (name, vault_config) = config.select(Some(&name))?;
-                set_busy(name, true);
-                unlock(&pinentry, &Vault::new(name, vault_config));
-                set_busy(name, false);
+                let Some(vault) = self.vault(&name) else {
+                    return;
+                };
+                self.set_busy(&name, true);
+                unlock(&self.pinentry, &vault);
+                self.set_busy(&name, false);
             }
             Action::Lock(name) => {
-                let (name, vault_config) = config.select(Some(&name))?;
-                set_busy(name, true);
-                if let Err(error) = Vault::new(name, vault_config).lock() {
-                    pinentry.show_error(&format!("Locking {name} failed: {error:#}"));
-                }
-                set_busy(name, false);
+                let Some(vault) = self.vault(&name) else {
+                    return;
+                };
+                self.set_busy(&name, true);
+                lock(&self.pinentry, &vault);
+                self.set_busy(&name, false);
             }
             Action::ChangePin(name) => {
-                let (name, vault_config) = config.select(Some(&name))?;
-                set_busy(name, true);
-                change_pin(&pinentry, &Vault::new(name, vault_config));
-                set_busy(name, false);
+                let Some(vault) = self.vault(&name) else {
+                    return;
+                };
+                self.set_busy(&name, true);
+                change_pin(&self.pinentry, &vault);
+                self.set_busy(&name, false);
+            }
+            Action::SetAutoLock(name, minutes) => {
+                self.state
+                    .auto_lock_minutes
+                    .insert(name.clone(), minutes.unwrap_or(0));
+                if let Err(error) = self.state.save() {
+                    tracing::warn!("saving the auto-lock setting failed: {error:#}");
+                }
+                // Count the change as activity so a shorter timeout does not lock at once.
+                if let Some(last) = self.activity.get(&name) {
+                    *last.lock().unwrap() = Instant::now();
+                }
             }
         }
-        refresh(&handle, &config);
     }
-    Ok(())
+
+    /// Locks vaults that have been idle for longer than their timeout.
+    fn auto_lock(&mut self) {
+        let names: Vec<String> = self.activity.keys().cloned().collect();
+        for name in names {
+            let Some(timeout) = self.auto_lock_minutes(&name) else {
+                continue;
+            };
+            let Some(vault) = self.vault(&name) else {
+                continue;
+            };
+            let last = self.activity[&name].clone();
+            if activity::in_use(&vault.config.mount_dir) {
+                *last.lock().unwrap() = Instant::now();
+                continue;
+            }
+            let idle = last.lock().unwrap().elapsed();
+            if idle < Duration::from_secs(timeout * 60) {
+                continue;
+            }
+            tracing::info!(
+                "auto-locking {name} after {} idle minutes",
+                idle.as_secs() / 60
+            );
+            match vault.lock(false) {
+                Ok(()) => notify(&format!(
+                    "Locked {name} after {} of inactivity",
+                    describe_minutes(timeout)
+                )),
+                Err(error) => tracing::warn!("auto-locking {name} failed: {error:#}"),
+            }
+        }
+    }
+
+    /// Re-reads mount state, starts or drops activity watchers, and updates the tray.
+    fn refresh(&mut self) {
+        let mut statuses = Vec::new();
+        for (name, vault_config) in self.config.visible_vaults() {
+            let vault = Vault::new(name, vault_config);
+            let mounted = vault.is_mounted();
+            if !mounted {
+                self.activity.remove(name);
+            } else if !self.activity.contains_key(name) {
+                let last = Arc::new(Mutex::new(Instant::now()));
+                let watched = last.clone();
+                let root = vault_config.mount_dir.clone();
+                std::thread::spawn(move || {
+                    if let Err(error) = activity::watch(&root, watched) {
+                        tracing::warn!("watching {} failed: {error:#}", root.display());
+                    }
+                });
+                self.activity.insert(name.to_owned(), last);
+            }
+            let auto_lock_minutes = self
+                .state
+                .auto_lock_minutes(name, vault_config.auto_lock_minutes);
+            let locks_in = match (auto_lock_minutes, self.activity.get(name)) {
+                (Some(timeout), Some(last)) => {
+                    let idle = last.lock().unwrap().elapsed().as_secs() / 60;
+                    Some(timeout.saturating_sub(idle).max(1))
+                }
+                _ => None,
+            };
+            statuses.push((name.to_owned(), mounted, auto_lock_minutes, locks_in));
+        }
+        self.handle.update(|tray: &mut Tray| {
+            for (name, mounted, auto_lock_minutes, locks_in) in statuses {
+                if let Some(status) = tray.vaults.iter_mut().find(|vault| vault.name == name) {
+                    status.mounted = mounted;
+                    status.auto_lock_minutes = auto_lock_minutes;
+                    status.locks_in = locks_in;
+                }
+            }
+        });
+    }
 }
 
-fn refresh(handle: &ksni::blocking::Handle<Tray>, config: &Config) {
-    handle.update(|tray: &mut Tray| {
-        for status in &mut tray.vaults {
-            if let Ok((name, vault_config)) = config.select(Some(&status.name)) {
-                status.mounted = Vault::new(name, vault_config).is_mounted();
+/// Locks, asking first if programs are using the vault.
+fn lock(pinentry: &Pinentry, vault: &Vault) {
+    let result = match vault.lock(false) {
+        Err(error) if error.downcast_ref::<vault::InUse>().is_some() => {
+            let users = &error.downcast_ref::<vault::InUse>().unwrap().0;
+            let question = format!(
+                "{} {} using the {} vault. Lock it anyway? They may lose access to open files, and unsaved changes may be lost.",
+                users.join(", "),
+                if users.len() == 1 { "is" } else { "are" },
+                vault.name
+            );
+            if !pinentry.confirm(&question, "Lock anyway") {
+                return;
+            }
+            vault.lock(true)
+        }
+        result => result,
+    };
+    if let Err(error) = result {
+        pinentry.show_error(&format!("Locking {} failed: {error:#}", vault.name));
+    }
+}
+
+/// Opens a folder without blocking the worker; falls back from xdg-open to gio.
+fn open_folder(pinentry: Pinentry, path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let openers: [&[&str]; 2] = [&["xdg-open"], &["gio", "open"]];
+        for opener in openers {
+            let (program, args) = opener.split_first().unwrap();
+            let opened = std::process::Command::new(program)
+                .args(args)
+                .arg(&path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|status| status.success());
+            if opened {
+                return;
             }
         }
+        pinentry.show_error(&format!(
+            "Could not open {}: no file manager is registered for folders.",
+            path.display()
+        ));
     });
+}
+
+fn notify(message: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .args(["--app-name=gocryptfs-tray", "Vault locked", message])
+        .spawn();
 }
 
 fn unlock(pinentry: &Pinentry, vault: &Vault) {

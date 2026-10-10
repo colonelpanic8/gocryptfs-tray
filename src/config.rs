@@ -35,6 +35,9 @@ pub struct VaultConfig {
     pub pin: bool,
     #[serde(default = "default_min_pin_length")]
     pub min_pin_length: usize,
+    /// Lock after this many idle minutes while the tray runs; the tray menu can override it.
+    #[serde(default)]
+    pub auto_lock_minutes: Option<u64>,
     pub backend: Backend,
 }
 
