@@ -45,6 +45,13 @@ pub fn watch(root: &Path, last: LastActivity) -> Result<()> {
                     .mask
                     .intersects(EventMask::OPEN | EventMask::ACCESS | EventMask::CLOSE_NOWRITE);
             if !listing {
+                if tracing::enabled!(tracing::Level::DEBUG) {
+                    let dir = dirs.get(&event.wd).map(PathBuf::as_path).unwrap_or(root);
+                    let path = event
+                        .name
+                        .map_or_else(|| dir.to_path_buf(), |name| dir.join(name));
+                    tracing::debug!("activity: {:?} {}", event.mask, path.display());
+                }
                 *last.lock().unwrap() = Instant::now();
             }
         }
@@ -91,12 +98,6 @@ fn add_tree(inotify: &mut Inotify, dirs: &mut HashMap<WatchDescriptor, PathBuf>,
             }
         }
     }
-}
-
-/// Whether any of this user's processes has a file open, or its working
-/// directory, inside `root`.
-pub fn in_use(root: &Path) -> bool {
-    !users(root).is_empty()
 }
 
 /// Names of this user's processes with a file open, or their working
@@ -150,7 +151,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("gocryptfs-tray-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
-        assert!(!in_use(&dir));
+        assert!(users(&dir).is_empty());
         let mut child = std::process::Command::new("sleep")
             .arg("30")
             .current_dir(&dir)
@@ -158,12 +159,10 @@ mod tests {
             .unwrap();
         // Give the child time to exec so /proc reflects its cwd.
         std::thread::sleep(Duration::from_millis(100));
-        let used = in_use(&dir);
         let names = users(&dir);
         child.kill().unwrap();
         child.wait().unwrap();
         std::fs::remove_dir_all(&dir).unwrap();
-        assert!(used);
         assert_eq!(names, ["sleep"]);
     }
 
