@@ -61,7 +61,7 @@ backend = { type = "direct", gocryptfs_args = ["-sharedstorage"] }
 Optional per-vault keys: `link` (the path to open, if different from
 `mount_dir`), `owner` (only show the vault to that user) and
 `auto_lock_minutes` (the default idle timeout). Timeouts chosen in the tray
-menu are saved in `~/.local/state/gocryptfs-tray/state.toml` and take
+menu, from 30 seconds to 4 hours, are saved in `~/.local/state/gocryptfs-tray/state.toml` and take
 precedence.
 
 The `direct` backend runs gocryptfs as you. The `systemd` backend hands the

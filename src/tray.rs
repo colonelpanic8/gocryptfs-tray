@@ -21,7 +21,8 @@ pub const TRAY_ID: &str = "gocryptfs-tray";
 const TICK: Duration = Duration::from_secs(1);
 /// How often to rescan /proc for processes using an unlocked vault.
 const USERS_SCAN: Duration = Duration::from_secs(5);
-const AUTO_LOCK_CHOICES: [u64; 6] = [5, 15, 30, 60, 120, 240];
+/// In seconds.
+const AUTO_LOCK_CHOICES: [u64; 8] = [30, 60, 300, 900, 1800, 3600, 7200, 14400];
 
 enum Action {
     Refresh,
@@ -30,14 +31,14 @@ enum Action {
     Lock(String),
     Open(String),
     ChangePin(String),
-    SetAutoLock(String, Option<u64>),
+    SetAutoLock(String, Option<Duration>),
 }
 
 struct VaultStatus {
     name: String,
     mounted: bool,
     busy: bool,
-    auto_lock_minutes: Option<u64>,
+    auto_lock_timeout: Option<Duration>,
     auto_lock: AutoLock,
 }
 
@@ -155,22 +156,26 @@ impl Tray {
 
 fn auto_lock_menu(vault: &VaultStatus, prefix: &str) -> MenuItem<Tray> {
     // Off, the standard choices, and a configured value that is not among them.
-    let mut choices: Vec<Option<u64>> = vec![None];
-    choices.extend(AUTO_LOCK_CHOICES.iter().map(|minutes| Some(*minutes)));
-    if !choices.contains(&vault.auto_lock_minutes) {
-        choices.push(vault.auto_lock_minutes);
+    let mut choices: Vec<Option<Duration>> = vec![None];
+    choices.extend(
+        AUTO_LOCK_CHOICES
+            .iter()
+            .map(|seconds| Some(Duration::from_secs(*seconds))),
+    );
+    if !choices.contains(&vault.auto_lock_timeout) {
+        choices.push(vault.auto_lock_timeout);
         choices[1..].sort();
     }
     let selected = choices
         .iter()
-        .position(|choice| *choice == vault.auto_lock_minutes)
+        .position(|choice| *choice == vault.auto_lock_timeout)
         .unwrap_or(0);
     let options = choices
         .iter()
         .map(|choice| RadioItem {
             label: match choice {
                 None => "Off".into(),
-                Some(minutes) => describe_minutes(*minutes),
+                Some(timeout) => describe(*timeout),
             },
             ..Default::default()
         })
@@ -193,11 +198,19 @@ fn auto_lock_menu(vault: &VaultStatus, prefix: &str) -> MenuItem<Tray> {
     .into()
 }
 
-fn describe_minutes(minutes: u64) -> String {
-    match minutes {
-        60 => "1 hour".into(),
-        minutes if minutes % 60 == 0 => format!("{} hours", minutes / 60),
-        minutes => format!("{minutes} minutes"),
+fn describe(timeout: Duration) -> String {
+    let seconds = timeout.as_secs();
+    let (count, unit) = if seconds.is_multiple_of(3600) {
+        (seconds / 3600, "hour")
+    } else if seconds.is_multiple_of(60) {
+        (seconds / 60, "minute")
+    } else {
+        (seconds, "second")
+    };
+    if count == 1 {
+        format!("1 {unit}")
+    } else {
+        format!("{count} {unit}s")
     }
 }
 
@@ -318,8 +331,7 @@ pub fn run(config: Config) -> Result<()> {
                 name: name.clone(),
                 mounted: false,
                 busy: false,
-                auto_lock_minutes: state
-                    .auto_lock_minutes(name, config.vaults[name].auto_lock_minutes),
+                auto_lock_timeout: state.auto_lock(name, config.vaults[name].auto_lock_minutes),
                 auto_lock: AutoLock::Off,
             })
             .collect(),
@@ -365,9 +377,9 @@ impl Worker {
             .map(|(name, config)| Vault::new(name, config))
     }
 
-    fn auto_lock_minutes(&self, name: &str) -> Option<u64> {
+    fn auto_lock_timeout(&self, name: &str) -> Option<Duration> {
         let configured = self.config.vaults.get(name)?.auto_lock_minutes;
-        self.state.auto_lock_minutes(name, configured)
+        self.state.auto_lock(name, configured)
     }
 
     fn set_busy(&self, name: &str, busy: bool) {
@@ -414,10 +426,10 @@ impl Worker {
                 change_pin(&self.pinentry, &vault);
                 self.set_busy(&name, false);
             }
-            Action::SetAutoLock(name, minutes) => {
+            Action::SetAutoLock(name, timeout) => {
                 self.state
-                    .auto_lock_minutes
-                    .insert(name.clone(), minutes.unwrap_or(0));
+                    .auto_lock_seconds
+                    .insert(name.clone(), timeout.map_or(0, |timeout| timeout.as_secs()));
                 if let Err(error) = self.state.save() {
                     tracing::warn!("saving the auto-lock setting failed: {error:#}");
                 }
@@ -433,11 +445,11 @@ impl Worker {
     fn auto_lock(&mut self) {
         let names: Vec<String> = self.activity.keys().cloned().collect();
         for name in names {
-            let Some(timeout) = self.auto_lock_minutes(&name) else {
+            let Some(timeout) = self.auto_lock_timeout(&name) else {
                 continue;
             };
             let last = self.activity[&name].clone();
-            let due = last.lock().unwrap().elapsed() >= Duration::from_secs(timeout * 60);
+            let due = last.lock().unwrap().elapsed() >= timeout;
             let stale = self
                 .users
                 .get(&name)
@@ -450,20 +462,17 @@ impl Worker {
                 self.users.insert(name.clone(), (Instant::now(), users));
             }
             let idle = last.lock().unwrap().elapsed();
-            if idle < Duration::from_secs(timeout * 60) {
+            if idle < timeout {
                 continue;
             }
             let Some(vault) = self.vault(&name) else {
                 continue;
             };
-            tracing::info!(
-                "auto-locking {name} after {} idle minutes",
-                idle.as_secs() / 60
-            );
+            tracing::info!("auto-locking {name} after {}s idle", idle.as_secs());
             match vault.lock(false) {
                 Ok(()) => notify(&format!(
                     "Locked {name} after {} of inactivity",
-                    describe_minutes(timeout)
+                    describe(timeout)
                 )),
                 Err(error) => tracing::warn!("auto-locking {name} failed: {error:#}"),
             }
@@ -490,25 +499,21 @@ impl Worker {
                 });
                 self.activity.insert(name.to_owned(), last);
             }
-            let auto_lock_minutes = self
-                .state
-                .auto_lock_minutes(name, vault_config.auto_lock_minutes);
-            let auto_lock = match (auto_lock_minutes, self.activity.get(name)) {
+            let auto_lock_timeout = self.state.auto_lock(name, vault_config.auto_lock_minutes);
+            let auto_lock = match (auto_lock_timeout, self.activity.get(name)) {
                 (Some(_), Some(_)) if self.users.get(name).is_some_and(|(_, u)| !u.is_empty()) => {
                     AutoLock::Waiting(self.users[name].1.clone())
                 }
-                (Some(timeout), Some(last)) => {
-                    AutoLock::At(*last.lock().unwrap() + Duration::from_secs(timeout * 60))
-                }
+                (Some(timeout), Some(last)) => AutoLock::At(*last.lock().unwrap() + timeout),
                 _ => AutoLock::Off,
             };
-            statuses.push((name.to_owned(), mounted, auto_lock_minutes, auto_lock));
+            statuses.push((name.to_owned(), mounted, auto_lock_timeout, auto_lock));
         }
         self.handle.update(|tray: &mut Tray| {
-            for (name, mounted, auto_lock_minutes, auto_lock) in statuses {
+            for (name, mounted, auto_lock_timeout, auto_lock) in statuses {
                 if let Some(status) = tray.vaults.iter_mut().find(|vault| vault.name == name) {
                     status.mounted = mounted;
-                    status.auto_lock_minutes = auto_lock_minutes;
+                    status.auto_lock_timeout = auto_lock_timeout;
                     status.auto_lock = auto_lock;
                 }
             }
